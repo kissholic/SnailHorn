@@ -96,7 +96,9 @@ _DEFAULTS: dict[str, Any] = {
         "funding_arbitrage": {
             "min_funding_rate": 0.0002,
             "spot_taker_fee": 0.001,
+            "spot_maker_fee": 0.0008,
             "swap_taker_fee": 0.0005,
+            "swap_maker_fee": 0.0002,
             "holding_periods": 1,
             "max_position_usd": 1000.0,
             "target_roi": 0.002,

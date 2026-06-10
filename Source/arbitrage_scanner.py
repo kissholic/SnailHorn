@@ -4,10 +4,14 @@ from typing import Any
 logger = logging.getLogger("snailhorn")
 
 
+def _round_down(value: float, step: float) -> float:
+    return (value // step) * step
+
+
 def _calc_costs(market_data: dict[str, Any], strategy_cfg: dict[str, Any]) -> dict[str, float]:
-    """计算交易成本（开仓 + 平仓）"""
-    spot_taker_fee = strategy_cfg.get("spot_taker_fee", 0.001)
-    swap_taker_fee = strategy_cfg.get("swap_taker_fee", 0.0005)
+    """计算交易成本（开仓 + 平仓），优先使用限价单 maker 费率"""
+    spot_fee = strategy_cfg.get("spot_maker_fee", strategy_cfg.get("spot_taker_fee", 0.001))
+    swap_fee = strategy_cfg.get("swap_maker_fee", strategy_cfg.get("swap_taker_fee", 0.0005))
     spot = market_data.get("spot") or {}
     swap = market_data.get("swap") or {}
 
@@ -17,14 +21,14 @@ def _calc_costs(market_data: dict[str, Any], strategy_cfg: dict[str, Any]) -> di
     spot_spread_pct = abs(spot.get("ask", 0) - spot.get("bid", 0)) / spot_mid if spot_mid else 0
     swap_spread_pct = abs(swap.get("ask", 0) - swap.get("bid", 0)) / swap_mid if swap_mid else 0
 
-    fee_cost_pct = spot_taker_fee + swap_taker_fee
+    fee_cost_pct = spot_fee + swap_fee
     spread_cost_pct = spot_spread_pct + swap_spread_pct
     open_cost_pct = fee_cost_pct + spread_cost_pct
     close_cost_pct = fee_cost_pct + spread_cost_pct
 
     return {
-        "spot_taker_fee": spot_taker_fee,
-        "swap_taker_fee": swap_taker_fee,
+        "spot_fee": spot_fee,
+        "swap_fee": swap_fee,
         "spot_spread_pct": spot_spread_pct,
         "swap_spread_pct": swap_spread_pct,
         "open_cost_pct": open_cost_pct,
@@ -86,6 +90,17 @@ def analyze_opportunity(
     spot_price = spot.get("last", 0)
     swap_price = swap.get("last", 0)
     quantity_btc = position_size_usd / spot_price if spot_price else 0
+
+    swap_min_qty = 0.01
+    if quantity_btc < swap_min_qty:
+        required_usd = swap_min_qty * spot_price
+        logger.info(
+            "仓位 %.6f BTC 低于合约最小下单量 %.2f BTC（需至少 $%.0f），跳过",
+            quantity_btc, swap_min_qty, required_usd,
+        )
+        return None
+
+    quantity_btc = _round_down(quantity_btc, swap_min_qty)
 
     if funding_rate_raw > 0:
         direction = "long_spot_short_swap"

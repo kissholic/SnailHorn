@@ -180,8 +180,12 @@ def open_hedge_position(
     result["spot_order"] = spot_order
 
     # 第二步：合约下单（失败则必须清仓现货）
+    swap_qty = _truncate_to_step(quantity, 0.01)
+    if swap_qty <= 0:
+        logger.critical("合约下单量 %.6f 低于最小精度 0.01，无法开仓", quantity)
+        _panic_flatten(exchange, "合约下单", f"数量 {quantity} 低于最小精度")
     try:
-        swap_order = _place_swap_order(exchange, direction, quantity)
+        swap_order = _place_swap_order(exchange, direction, swap_qty)
     except Exception as e:
         _panic_flatten(exchange, "合约下单", str(e))
 
@@ -326,3 +330,39 @@ def _dry_run_result(opportunity: dict[str, Any]) -> dict[str, Any]:
         "success": True,
         "dry_run": True,
     }
+
+
+def _truncate_to_step(value: float, step: float) -> float:
+    return (value // step) * step
+
+
+def fetch_positions(exchange_config: dict[str, Any]) -> list[dict[str, Any]]:
+    """从交易所查询实际合约持仓
+
+    Returns:
+        持仓列表，每项含 symbol, side, contracts, notional, unrealizedPnl 等
+    """
+    try:
+        cfg = exchange_config.copy()
+        cfg.pop("enabled", None)
+        cfg.pop("options", None)
+        exchange: ccxt.Exchange = ccxt.okx(cfg)
+        positions = exchange.fetch_positions([_SWAP_SYMBOL])
+        result = []
+        for p in positions:
+            contracts = abs(float(p.get("contracts", 0) or 0))
+            if contracts > 1e-8:
+                result.append({
+                    "symbol": p.get("symbol", _SWAP_SYMBOL),
+                    "side": p.get("side", ""),
+                    "contracts": contracts,
+                    "notional": float(p.get("notional", 0) or 0),
+                    "unrealized_pnl": float(p.get("unrealizedPnl", 0) or 0),
+                    "entry_price": float(p.get("entryPrice", 0) or 0),
+                    "mark_price": float(p.get("markPrice", 0) or 0),
+                    "margin": float(p.get("initialMargin", 0) or 0),
+                })
+        return result
+    except Exception as e:
+        logger.error("查询交易所持仓失败: %s", e)
+        return []

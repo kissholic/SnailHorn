@@ -54,6 +54,12 @@ def _create_exchange(exchange_config: dict[str, Any]) -> ccxt.Exchange:
     cfg = exchange_config.copy()
     exchange_name = cfg.pop("name", "okx")
     cfg.pop("enabled", None)
+
+    https_proxy = cfg.pop("httpsProxy", None)
+    if https_proxy:
+        cfg["proxies"] = {"http": https_proxy, "https": https_proxy}
+        cfg["verify"] = False
+
     exchange: ccxt.Exchange = getattr(ccxt, exchange_name)(cfg)
     return exchange
 
@@ -204,3 +210,85 @@ def fetch_all_funding_histories(
         except Exception as e:
             logger.error("[%s] 拉取资金费率历史异常: %s", ex_id, e)
     return result
+
+
+def get_swap_volumes(exchange_configs: list[dict[str, Any]]) -> dict[str, float]:
+    """获取各交易所 BTC 永续合约 24h 成交量 (USDT)"""
+    import warnings
+    import urllib3
+    warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
+
+    volumes: dict[str, float] = {}
+    for cfg in exchange_configs:
+        ex_id = _exchange_id(cfg)
+        try:
+            vol_cfg = cfg.copy()
+            for k in ("testnet", "apiKey", "secret", "password"):
+                vol_cfg.pop(k, None)
+            ex = _create_exchange(vol_cfg)
+            ticker = ex.fetch_ticker(_SWAP_SYMBOL)
+            vol = float(ticker.get("quoteVolume", 0) or 0)
+            if vol <= 0:
+                info = ticker.get("info", {})
+                vol = float(info.get("volCcy24h", 0) or 0) * float(ticker.get("last", 0) or 0)
+            if vol <= 0:
+                vol = float(ticker.get("baseVolume", 0) or 0) * float(ticker.get("last", 0) or 0)
+            volumes[ex_id] = vol
+        except Exception as e:
+            logger.warning("[%s] 获取成交量失败: %s", ex_id, e)
+            volumes[ex_id] = 0
+    return volumes
+
+
+def compute_weighted_market(
+    all_markets: dict[str, dict[str, Any]],
+    volumes: dict[str, float],
+) -> dict[str, Any]:
+    """根据各交易所成交量权重，计算加权资金费率
+
+    只做空方收取的费率 (long_spot_short_swap) 需要正费率，因此：
+    - 正费率的交易所权重高 → 加权后仍为正 → 适合建仓
+    - 负费率的交易所权重高 → 加权后为负 → 当前不适合
+
+    Returns:
+        含 weighted_funding_rate 和 spot_price/swap_price 的字典，
+        可直接传给 analyze_opportunity 使用。
+    """
+    total_vol = sum(v for v in volumes.values() if v > 0)
+    if total_vol <= 0:
+        first = next(iter(all_markets.values()), {})
+        return first
+
+    weighted_rate = 0.0
+    spot_price_w = 0.0
+    swap_price_w = 0.0
+    spot_count = 0
+    swap_count = 0
+
+    for ex_id, data in all_markets.items():
+        w = volumes.get(ex_id, 0) / total_vol if total_vol else 0
+        if w <= 0:
+            continue
+        funding = data.get("funding_rate") or {}
+        fr = funding.get("funding_rate")
+        if fr is not None:
+            weighted_rate += fr * w
+        spot = data.get("spot") or {}
+        sp = spot.get("last")
+        if sp:
+            spot_price_w += sp * w
+            spot_count += 1
+        swap = data.get("swap") or {}
+        sw = swap.get("last")
+        if sw:
+            swap_price_w += sw * w
+            swap_count += 1
+
+    return {
+        "spot": {"last": spot_price_w, "bid": spot_price_w, "ask": spot_price_w},
+        "swap": {"last": swap_price_w, "bid": swap_price_w, "ask": swap_price_w},
+        "funding_rate": {
+            "funding_rate": weighted_rate,
+            "funding_rate_pct": weighted_rate * 100,
+        },
+    }
